@@ -1,73 +1,131 @@
 library(xml2)
-library(tidyverse)
+library(data.table)
 library(lubridate)
+library(slider)
 
-parse_health <- function(xml_path) {
+parse_health_fast <- function(xml_path) {
   
-  #-----------------------------
-  # Load XML
-  #-----------------------------
   xml <- read_xml(xml_path)
   
   #-----------------------------
-  # Parse all <Record> entries
+  # Records
   #-----------------------------
-  records <- xml %>%
-    xml_find_all("//Record") %>%
-    map_df(function(node) {
-      tibble(
-        type  = xml_attr(node, "type"),
-        start = ymd_hms(xml_attr(node, "startDate"), tz = "America/New_York"),
-        end   = ymd_hms(xml_attr(node, "endDate"),   tz = "America/New_York"),
-        value = xml_attr(node, "value")
-      )
-    }) %>%
-    mutate(value = suppressWarnings(as.numeric(value)))
+  rec_nodes <- xml_find_all(xml, "//Record")
+  
+  records <- data.table(
+    type  = xml_attr(rec_nodes, "type"),
+    start = ymd_hms(xml_attr(rec_nodes, "startDate"), tz="America/New_York"),
+    end   = ymd_hms(xml_attr(rec_nodes, "endDate"),   tz="America/New_York"),
+    value = suppressWarnings(as.numeric(xml_attr(rec_nodes, "value")))
+  )
   
   #-----------------------------
-  # Parse all <Workout> entries
+  # Workouts
   #-----------------------------
-  workouts <- xml %>%
-    xml_find_all("//Workout") %>%
-    map_df(function(node) {
-      tibble(
-        type     = xml_attr(node, "workoutActivityType"),
-        start    = ymd_hms(xml_attr(node, "startDate"), tz = "America/New_York"),
-        end      = ymd_hms(xml_attr(node, "endDate"),   tz = "America/New_York"),
-        duration = as.numeric(xml_attr(node, "duration")),
-        distance = as.numeric(xml_attr(node, "totalDistance")),
-        energy   = as.numeric(xml_attr(node, "totalEnergyBurned"))
-      )
-    })
+  wk_nodes <- xml_find_all(xml, "//Workout")
+  
+  workouts <- data.table(
+    workout_id = seq_along(wk_nodes),
+    type       = xml_attr(wk_nodes, "workoutActivityType"),
+    start      = ymd_hms(xml_attr(wk_nodes, "startDate"), tz="America/New_York"),
+    end        = ymd_hms(xml_attr(wk_nodes, "endDate"),   tz="America/New_York"),
+    duration   = as.numeric(xml_attr(wk_nodes, "duration")),
+    distance   = suppressWarnings(as.numeric(xml_attr(wk_nodes, "totalDistance"))),
+    energy     = suppressWarnings(as.numeric(xml_attr(wk_nodes, "totalEnergyBurned")))
+  )
   
   #-----------------------------
-  # Extract heart-rate samples
+  # Heart Rate Interval Join (Corrected)
   #-----------------------------
-  hr <- records %>%
-    filter(type == "HKQuantityTypeIdentifierHeartRate") %>%
-    drop_na(value)
+  
+  # HR samples
+  hr <- records[type == "HKQuantityTypeIdentifierHeartRate" & !is.na(value)]
+  hr[, hr_start := start]
+  hr[, hr_end   := start]   # zero-length interval
+  
+  # Workout intervals
+  wk_intervals <- workouts[, .(workout_id, wk_start = start, wk_end = end)]
+  
+  # Set keys for overlap
+  setkey(hr, hr_start, hr_end)
+  setkey(wk_intervals, wk_start, wk_end)
+  
+  # Interval join
+  hr_join <- foverlaps(
+    hr[, .(hr_start, hr_end, value)],
+    wk_intervals,
+    by.x = c("hr_start", "hr_end"),
+    by.y = c("wk_start", "wk_end"),
+    type = "within",
+    nomatch = 0
+  )
+  
+  # Aggregate HR stats
+  hr_stats <- hr_join[
+    ,
+    .(
+      avg_hr = mean(value, na.rm = TRUE),
+      max_hr = max(value, na.rm = TRUE)
+    ),
+    by = workout_id
+  ]
+  
+  # Merge back
+  workouts <- merge(workouts, hr_stats, by = "workout_id", all.x = TRUE)
   
   #-----------------------------
-  # Compute avg_hr and max_hr per workout
+  # Daily Metrics
   #-----------------------------
-  workouts <- workouts %>%
-    rowwise() %>%
-    mutate(
-      avg_hr = mean(hr$value[hr$start >= start & hr$start <= end], na.rm = TRUE),
-      max_hr = max(hr$value[hr$start >= start & hr$start <= end], na.rm = TRUE)
-    ) %>%
-    ungroup()
+  records[, date := as_date(start)]
   
-  # Replace NaN (from mean of empty set) with NA
-  workouts <- workouts %>%
-    mutate(
-      avg_hr = ifelse(is.nan(avg_hr), NA, avg_hr),
-      max_hr = ifelse(is.nan(max_hr), NA, max_hr)
-    )
+  daily_hrv <- records[
+    type == "HKQuantityTypeIdentifierHeartRateVariabilitySDNN",
+    .(hrv = mean(value, na.rm = TRUE)),
+    by = date
+  ]
+  
+  daily_rhr <- records[
+    type == "HKQuantityTypeIdentifierRestingHeartRate",
+    .(rhr = mean(value, na.rm = TRUE)),
+    by = date
+  ]
+  
+  daily_vo2 <- records[
+    type == "HKQuantityTypeIdentifierVO2Max",
+    .(vo2 = mean(value, na.rm = TRUE)),
+    by = date
+  ]
+  
+  workouts[, date := as_date(start)]
+  
+  workouts <- merge(workouts, daily_hrv, by="date", all.x=TRUE)
+  workouts <- merge(workouts, daily_rhr, by="date", all.x=TRUE)
+  workouts <- merge(workouts, daily_vo2, by="date", all.x=TRUE)
+  
+  # Ensure columns exist
+  if (!"hrv" %in% names(workouts)) workouts[, hrv := NA_real_]
+  if (!"rhr" %in% names(workouts)) workouts[, rhr := NA_real_]
+  if (!"vo2" %in% names(workouts)) workouts[, vo2 := NA_real_]
   
   #-----------------------------
-  # Return parsed data
+  # Rolling Metrics
   #-----------------------------
+  setorder(workouts, date)
+  
+  if (nrow(workouts) > 0) {
+    workouts[, hrv_7d := slide_dbl(hrv, mean, .before=6, .complete=TRUE)]
+    workouts[, rhr_7d := slide_dbl(rhr, mean, .before=6, .complete=TRUE)]
+    workouts[, vo2_7d := slide_dbl(vo2, mean, .before=6, .complete=TRUE)]
+    workouts[, mileage_7d := slide_dbl(distance, sum, .before=6, .complete=TRUE)]
+  } else {
+    workouts[, `:=`(
+      hrv_7d = numeric(),
+      rhr_7d = numeric(),
+      vo2_7d = numeric(),
+      mileage_7d = numeric()
+    )]
+  }
+  
   list(
     records = records,
     workouts = workouts
